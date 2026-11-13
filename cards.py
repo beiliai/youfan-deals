@@ -1,4 +1,4 @@
-"""Build shopping cards from current Youfan products."""
+"""Build shopping cards from current Beili products."""
 import argparse
 import base64
 import html
@@ -43,11 +43,11 @@ def check_link(url):
     return "unconfirmed"
 
 
-def prepare_card(item):
+def prepare_card(item, include_links=True):
     # An arbitrary source URL may belong to a different publisher or have no tracking.
     # It must never become the picture, purchase button or password fallback.
     promotion, url, status = {}, None, "unconfirmed"
-    for _ in range(2):
+    for _ in range(2 if include_links else 0):
         try:
             promotion = get_promotion(item["platform"], item["item_id"])
             candidate = promotion.get("coupon_url") or promotion.get("promotion_url")
@@ -60,7 +60,7 @@ def prepare_card(item):
     generated = bool(url)
     label = ("领券看看" if generated and promotion.get("coupon_url")
              and item["coupon"]["status"] == "reported_active" else "去看看")
-    warning = "" if generated else "暂未生成推广入口，请刷新后再试。"
+    warning = "" if generated or not include_links else "暂未生成推广入口，请稍后再试。"
     coupon = item["coupon"]
     if coupon["status"] == "reported_active":
         amount = money(coupon["amount_cny"])
@@ -77,7 +77,8 @@ def prepare_card(item):
     return {**item, "buy_url": url, "button_label": label, "coupon_badge": badge,
             "coupon_condition": condition, "coupon_expires": expires,
             "link_check": status, "warning": warning,
-            "promotion_generated": generated, "commission_guaranteed": False,
+            "promotion_generated": generated, "external_access_requested": include_links,
+            "commission_guaranteed": False,
             "attribution_mode": "operator" if generated else "unverified",
             "operator_pid": promotion.get("operator_pid") if generated else None,
             "taobao_password": promotion.get("taobao_password") if generated else None}
@@ -85,7 +86,8 @@ def prepare_card(item):
 
 def get_shopping_cards(keyword: str = "", platform: str = "all",
                        links: list[str] | None = None, max_price: str | None = None,
-                       only_coupon: bool = False, limit: int = 4, pages: int = 2):
+                       only_coupon: bool = False, limit: int = 4, pages: int = 2,
+                       include_links: bool = False):
     """Fetch checked products with images, coupons and current purchase links."""
     links = links or []
     if len(links) > 8 or (not links and not keyword.strip()):
@@ -102,7 +104,7 @@ def get_shopping_cards(keyword: str = "", platform: str = "all",
         result = search_deals(keyword, platform, max_price, only_coupon, limit, pages)
         items, errors, scanned = result["items"], result["errors"], result["pages_checked"]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        cards = list(pool.map(prepare_card, items))
+        cards = list(pool.map(lambda item: prepare_card(item, include_links=include_links), items))
     return {"items": cards, "errors": errors, "pages_checked": scanned,
             "checked_at": datetime.now(CHINA).isoformat(timespec="seconds")}
 
@@ -119,12 +121,14 @@ def render_cards(result):
                  'referrerpolicy="no-referrer" loading="lazy">' if image else
                  '<div class="no-photo">暂无商品图</div>')
         # Older saved sessions must not re-enable the original-link fallback.
-        url = https_link(item.get("buy_url")) if item.get("promotion_generated") is True else None
+        requested = item.get("external_access_requested") is True
+        url = https_link(item.get("buy_url")) if item.get("promotion_generated") is True and requested else None
         title = escape(item["title"])
         picture = f'<a class="photo" href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{photo}</a>' if url else f'<div class="photo">{photo}</div>'
         button = (f'<a class="buy" href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{escape(item["button_label"])}</a>'
-                  if url else '<span class="buy disabled">推广入口暂不可用</span>')
-        warning = f'<p class="notice">{escape(item.get("warning") or "暂未生成推广入口，请刷新后再试。")}</p>' if not url else ""
+                  if url else '<span class="buy disabled">'+('推广入口暂不可用' if requested else '价格与优惠信息')+'</span>')
+        warning = f'<p class="notice">{escape(item.get("warning") or "暂未生成推广入口，请稍后再试。")}</p>' if requested and not url else ""
+        disclosure = '<p class="notice">推广链接：将前往'+brand+'。购买后贝礼可能获得佣金，不代表你会获得返现。</p>' if url else ""
         active = item["coupon"]["status"] == "reported_active"
         coupon = (f'<div class="coupon"><strong>{escape(item["coupon_badge"])}</strong><span>{escape(item["coupon_condition"])}</span></div>'
                   if active else f'<div class="no-coupon">{escape(item["coupon_badge"])}</div>')
@@ -133,18 +137,21 @@ def render_cards(result):
         cards.append(f'''<article class="card">
 {picture}<div class="body"><span class="platform">{brand}</span><h2>{title}</h2>
 <div class="price"><span>¥</span>{price_text}{old}</div><div class="price-label">现在显示的价格</div>
-{coupon}<div class="expires">{escape(item["coupon_expires"])}</div>{button}{warning}
+{coupon}<div class="expires">{escape(item["coupon_expires"])}</div>{disclosure}{button}{warning}
 </div></article>''')
     logo = Path(__file__).resolve().parent / "logo.png"
     logo_html = ""
     if logo.exists():
         encoded = base64.b64encode(logo.read_bytes()).decode("ascii")
-        logo_html = f'<img class="logo" src="data:image/png;base64,{encoded}" alt="优返查券">'
+        logo_html = f'<img class="logo" src="data:image/png;base64,{encoded}" alt="贝礼查券">'
     empty = '<p class="empty">这次没查到合适的商品，换个关键词试试。</p>' if not cards else ""
     errors = "".join(f'<p class="notice">{escape(str(message))}</p>' for message in result["errors"].values())
+    note = ("商品价格和优惠会变化，领取资格和最终付款金额以商品页为准。这是推广链接，购买后贝礼可能获得佣金，不代表用户返利承诺。"
+            if any(row.get('promotion_generated') is True and row.get('external_access_requested') is True for row in result['items'])
+            else "本页展示本次核对的价格和优惠信息，不代表全网最低价；未生成购买推广入口。")
     return '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>优返查券 · 看看今天的优惠</title><style>
+<title>贝礼查券 · 看看今天的优惠</title><style>
 *{box-sizing:border-box}body{margin:0;background:#fff7f2;color:#28211f;font-family:"PingFang SC","Microsoft YaHei",sans-serif}
 main{max-width:1100px;margin:auto;padding:28px 20px 42px}header{display:flex;align-items:center;gap:13px;margin-bottom:26px}
 .logo{width:52px;height:52px;border-radius:15px}h1{font-size:25px;margin:0 0 5px}header p{margin:0;color:#8a7066;font-size:13px}
@@ -159,7 +166,7 @@ h2{font-size:15px;font-weight:550;line-height:1.6;margin:9px 0 13px;min-height:4
 .expires{font-size:11px;color:#a08a80;min-height:27px;padding-top:7px}.buy{display:block;text-align:center;background:linear-gradient(100deg,#ff6d20,#f23923);border-radius:10px;padding:12px;color:white;text-decoration:none;font-weight:600;font-size:14px}
 .buy:hover{filter:brightness(1.06)}.buy.disabled{background:#e6dcd7;color:#8f817a}.note{font-size:12px;line-height:1.8;color:#a08779;margin-top:24px}.notice{color:#8f6252;font-size:13px}
 @media(max-width:550px){main{padding:18px 12px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.body{padding:11px}h2{font-size:13px;min-height:42px}.price{font-size:26px}.coupon{gap:5px;padding:8px 6px}.coupon strong{font-size:15px}.coupon span{font-size:10px;padding-left:5px}.logo{width:44px;height:44px}h1{font-size:22px}}
-</style></head><body><main><header>''' + logo_html + '''<div><h1>优返查券</h1><p>想买的好物，先看看有没有优惠</p></div></header><section class="grid">''' + "".join(cards) + empty + '''</section>''' + errors + '''<p class="note">能不能领券、最后付多少，打开商品页就能看。商品价格和优惠会变化，点击按钮前往平台。这是推广链接，购买后优返可能获得佣金，不代表用户返利承诺。</p></main></body></html>'''
+</style></head><body><main><header>''' + logo_html + '''<div><h1>贝礼查券</h1><p>想买的好物，先看看有没有优惠</p></div></header><section class="grid">''' + "".join(cards) + empty + '''</section>''' + errors + '<p class="note">'+escape(note)+'</p></main></body></html>'
 
 
 def main():
@@ -171,6 +178,8 @@ def main():
     parser.add_argument("--only-coupon", action="store_true")
     parser.add_argument("--limit", type=int, default=4)
     parser.add_argument("--pages", type=int, default=2)
+    parser.add_argument("--with-links", dest="include_links", action="store_true",
+                        help="Only after the user explicitly requests purchase or coupon access")
     parser.add_argument("--output", required=True)
     args = vars(parser.parse_args())
     destination = Path(args.pop("output")).resolve()

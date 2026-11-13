@@ -1,6 +1,7 @@
-"""Youfan's public product catalogue and operator promotion client."""
+"""Beili's public product catalogue and operator promotion client."""
 
 import argparse
+import html
 import json
 import re
 import sys
@@ -244,17 +245,41 @@ def share_link(text):
     return url, parts
 
 
+def page_share_target(body):
+    """Read a literal destination from Taobao's share page; never execute scripts."""
+    match = re.search(r'''\bvar\s+url\s*=\s*(['"])(https://[^\r\n]*?)\1\s*;''', body)
+    if not match:
+        return None
+    target = html.unescape(match[2])
+    # Only the escape sequences used in URL literals are needed here.
+    return re.sub(r"\\(?:/|u0026|u003d|u003f)",
+                  lambda m: {r"\/": "/", r"\u0026": "&", r"\u003d": "=", r"\u003f": "?"}[m[0]], target)
+
+
 def follow_store_link(url, hosts):
-    """Follow only redirects within the supported storefront hosts."""
+    """Bounded allowlisted HTTP/HTML redirects, with no cookies or JS execution."""
     opener = build_opener(NoRedirect())
-    for _ in range(4):
+    seen = set()
+    for _ in range(5):
         _, parts = share_link(url)
-        if parts.hostname not in hosts or parts.scheme != "https" or parts.port not in (None, 443):
+        if parts.hostname not in hosts or parts.scheme != "https" or parts.port not in (None, 443) or url in seen:
             break
+        seen.add(url)
         try:
             request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with opener.open(request, timeout=5):
-                return url
+            with opener.open(request, timeout=8) as response:
+                if parts.hostname not in {"m.tb.cn", "e.tb.cn"}:
+                    return url
+                body = response.read(262145)
+                if len(body) > 262144:
+                    return None
+                target = page_share_target(body.decode("utf-8", "replace"))
+                if not target:
+                    return url
+                _, destination = share_link(target)
+                if destination.hostname not in hosts or destination.scheme != "https":
+                    return None
+                url = target
         except HTTPError as exc:
             location = exc.headers.get("Location")
             if exc.code not in (301, 302, 303, 307, 308) or not location:
@@ -277,6 +302,7 @@ def link_item_id(parts, keys, pattern=ITEM_ID):
 def lookup_link(text: str):
     """Check the exact product and coupon from a Taobao or Pinduoduo share link."""
     url, parts = share_link(text)
+    parse_url = url
     host = parts.hostname
     item_id = None
     if host in TAOBAO_ITEM_HOSTS | TAOBAO_SHARE_HOSTS:
@@ -285,11 +311,12 @@ def lookup_link(text: str):
             expanded = follow_store_link(url, TAOBAO_ITEM_HOSTS | TAOBAO_SHARE_HOSTS)
             if expanded:
                 parts = urlsplit(expanded)
+                parse_url = expanded
         if parts.hostname in TAOBAO_ITEM_HOSTS and parts.path.lower().endswith(("/item.htm", "/detail.htm", "/item.html")):
             item_id = link_item_id(parts, ("id", "itemId", "item_id"))
         if not item_id:
             try:
-                parsed = fetch("/tao/goods/parse", content=url)
+                parsed = fetch("/tao/goods/parse", content=parse_url)
             except DealError as exc:
                 raise DealError("这条淘宝分享链接暂时识别不了，请发商品详情页的链接。") from exc
             item_id = str(parsed.get("goodsId") or parsed.get("itemId") or "")
